@@ -1,0 +1,325 @@
+"""
+Cyber Lens: Network Traffic Anomaly Detection — Full Pipeline
+Author: Muqadas Aijaz (muqs)
+
+Run:
+  pip install -r requirements.txt
+  python cyber_lens_pipeline.py --file data/ee7e1853-d39e-48dc-a7c4-1eefedb2b1ee.csv
+
+Outputs:
+  figures/  -> PNG charts + predictions_with_scores.csv
+"""
+
+import os
+import argparse
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
+
+# -------------------- CONFIG --------------------
+RANDOM_STATE = 42
+CONTAMINATION = 0.10
+
+# -------------------- UTILS --------------------
+def ensure_figdir(path: str = "figures") -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def load_and_encode(file_path: str):
+    df = pd.read_csv(file_path)
+    df_enc = df.copy()
+    for col in df_enc.select_dtypes("bool"):
+        df_enc[col] = df_enc[col].astype(int)
+    return df, df_enc
+
+def quick_overview(df: pd.DataFrame) -> None:
+    print("📦 Dataset Shape:", df.shape)
+    print("\n🧾 Dataset Info:")
+    print("-" * 50)
+    print(df.info())
+    print("\n⚠️ Missing Values Per Column:")
+    print(df.isnull().sum())
+    print("\n📊 Summary Statistics:")
+    print(df.describe().T)
+
+# -------------------- EDA PLOTS --------------------
+def plot_correlation_heatmap(df: pd.DataFrame, outdir: str):
+    plt.figure(figsize=(10, 8))
+    num = df.select_dtypes(include=["number"])
+    sns.heatmap(num.corr(), cmap="coolwarm", annot=False)
+    plt.title("Feature Correlation Heatmap")
+    p = os.path.join(outdir, "01_corr_heatmap.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+def plot_label_pie(df: pd.DataFrame, outdir: str):
+    if "label" in df.columns:
+        plt.figure(figsize=(5, 5))
+        vc = df["label"].value_counts()
+        labels = [f"{int(k)}" for k in vc.index]
+        vc.plot(kind="pie", autopct="%1.1f%%", labels=labels)
+        plt.title("Label Distribution (0=Normal, 1=Anomaly)")
+        plt.ylabel("")
+        p = os.path.join(outdir, "02_label_pie.png")
+        plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+        print(f"Saved: {p}")
+
+def plot_feature_trends(df: pd.DataFrame, outdir: str):
+    cols = [c for c in ["packet_size", "inter_arrival_time", "spectral_entropy"] if c in df.columns]
+    if not cols: 
+        return
+    plt.figure(figsize=(12, 6))
+    for c in cols:
+        plt.plot(df[c].values, label=c, alpha=0.9)
+    plt.title("Feature Behavior Over Samples")
+    plt.xlabel("Sample Index"); plt.ylabel("Value"); plt.legend()
+    p = os.path.join(outdir, "03_feature_trends.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+# -------------------- ISOLATION FOREST --------------------
+def fit_isolation_forest(X: pd.DataFrame) -> IsolationForest:
+    iso = IsolationForest(
+        n_estimators=200,
+        contamination=CONTAMINATION,
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+    iso.fit(X)
+    return iso
+
+def add_iforest_predictions(df: pd.DataFrame, X: pd.DataFrame, iso: IsolationForest) -> pd.DataFrame:
+    df_out = df.copy()
+    pred = iso.predict(X)  # 1 normal, -1 anomaly
+    df_out["iso_anomaly"] = pd.Series(pred).replace({1: 0, -1: 1}).astype(int)
+    scores = iso.decision_function(X)  # higher = more normal
+    df_out["iso_score"] = -scores      # higher = more anomalous
+    return df_out
+
+def plot_iforest_scatter(df_with: pd.DataFrame, outdir: str):
+    x, y = None, None
+    for c in ["packet_size", "src_port", "spectral_entropy"]:
+        if c in df_with.columns and x is None: x = c
+    for c in ["inter_arrival_time", "dst_port", "frequency_band_energy"]:
+        if c in df_with.columns and y is None: y = c
+    if x is None or y is None: return
+
+    plt.figure(figsize=(10, 6))
+    sns.scatterplot(
+        x=x, y=y,
+        hue="iso_anomaly",
+        palette={0: "tab:green", 1: "tab:red"},
+        data=df_with, alpha=0.7
+    )
+    plt.title(f"Isolation Forest: Anomalies ({x} vs {y})")
+    plt.xlabel(x); plt.ylabel(y)
+    plt.legend(title="Type", labels=["Normal", "Anomaly"])
+    p = os.path.join(outdir, "04_iforest_scatter.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+# -------------------- EXPLANATIONS --------------------
+def explain_with_permutation_importance(X: pd.DataFrame, y_proxy: pd.Series, outdir: str) -> pd.DataFrame:
+    clf = RandomForestClassifier(
+        n_estimators=300,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        class_weight="balanced"
+    )
+    clf.fit(X, y_proxy.astype(int))
+    perm = permutation_importance(clf, X, y_proxy.astype(int), n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1)
+    imp_df = (pd.DataFrame({
+        "feature": X.columns,
+        "permutation_importance": perm.importances_mean,
+        "importance_std": perm.importances_std
+    }).sort_values("permutation_importance", ascending=False).reset_index(drop=True))
+
+    plt.figure(figsize=(11, 5))
+    plt.bar(imp_df["feature"].head(12), imp_df["permutation_importance"].head(12))
+    plt.title("Top Features (Permutation Importance, proxy)")
+    plt.xticks(rotation=45, ha="right"); plt.ylabel("Mean importance")
+    p = os.path.join(outdir, "05_perm_importance.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+    return imp_df
+
+def group_diff_table(df_with: pd.DataFrame, X_cols: list, outdir: str) -> pd.DataFrame:
+    grp = (df_with.groupby("iso_anomaly")[X_cols]
+           .mean()
+           .rename(index={0: "Normal", 1: "Anomaly"})
+           .T)
+    diff = (grp["Anomaly"] - grp["Normal"]).abs().sort_values(ascending=False)
+    diff_df = diff.to_frame(name="|mean_diff|").reset_index().rename(columns={"index": "feature"})
+    csv_path = os.path.join(outdir, "06_group_diffs.csv")
+    diff_df.to_csv(csv_path, index=False)
+    print(f"Saved: {csv_path}")
+    return diff_df
+
+# -------------------- CLUSTER VIEWS --------------------
+def plot_pairplot(df_with: pd.DataFrame, outdir: str):
+    cols = [c for c in ["packet_size", "inter_arrival_time", "spectral_entropy", "frequency_band_energy"] if c in df_with.columns]
+    if len(cols) < 2: return
+    try:
+        sample = df_with.sample(min(300, len(df_with)), random_state=RANDOM_STATE)
+        g = sns.pairplot(sample, vars=cols, hue="iso_anomaly",
+                         palette={0: "tab:green", 1: "tab:red"},
+                         diag_kind="kde", corner=True)
+        g.fig.suptitle("Multi-Feature Anomaly Clusters", y=1.02)
+        p = os.path.join(outdir, "07_pairplot.png")
+        plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+        print(f"Saved: {p}")
+    except Exception as e:
+        print(f"[pairplot skipped: {e}]")
+
+def plot_ports_scatter(df_with: pd.DataFrame, outdir: str):
+    if "src_port" not in df_with.columns or "dst_port" not in df_with.columns: return
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(x="src_port", y="dst_port", hue="iso_anomaly",
+                    palette={0: "tab:green", 1: "tab:red"},
+                    data=df_with, alpha=0.7)
+    plt.title("Port Relationship: Source vs Destination")
+    plt.xlabel("Source Port"); plt.ylabel("Destination Port")
+    p = os.path.join(outdir, "08_ports_scatter.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+def plot_entropy_energy(df_with: pd.DataFrame, outdir: str):
+    if "spectral_entropy" not in df_with.columns or "frequency_band_energy" not in df_with.columns: return
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(
+        x="spectral_entropy", y="frequency_band_energy",
+        hue="iso_anomaly", palette={0: "tab:green", 1: "tab:red"},
+        data=df_with, alpha=0.7
+    )
+    plt.title("Spectral Entropy vs Frequency Band Energy")
+    plt.xlabel("Spectral Entropy"); plt.ylabel("Frequency Band Energy")
+    p = os.path.join(outdir, "09_entropy_energy.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+def plot_syn_count(df_with: pd.DataFrame, outdir: str):
+    if "tcp_flags_SYN" not in df_with.columns: return
+    plt.figure(figsize=(7, 5))
+    sns.countplot(x="tcp_flags_SYN", hue="iso_anomaly",
+                  data=df_with, palette={0: "tab:green", 1: "tab:red"})
+    plt.title("SYN Flag Frequency (Normal vs Anomaly)")
+    plt.xlabel("TCP SYN Flag (0/1)"); plt.ylabel("Count")
+    p = os.path.join(outdir, "10_syn_count.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+# -------------------- LOF VALIDATION --------------------
+def lof_validation(df_enc: pd.DataFrame, df_if: pd.DataFrame, outdir: str) -> pd.DataFrame:
+    X = df_enc.drop(columns=[c for c in ["label"] if c in df_enc.columns])
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    lof = LocalOutlierFactor(n_neighbors=20, contamination=CONTAMINATION)
+    lof_pred = lof.fit_predict(Xs)  # 1 normal, -1 anomaly
+    out = df_if.copy()
+    out["lof_anomaly"] = (lof_pred == -1).astype(int)
+    out["agree"] = (out["lof_anomaly"] == out["iso_anomaly"]).astype(int)
+
+    # LOF scatter
+    if "spectral_entropy" in out.columns and "frequency_band_energy" in out.columns:
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=out["spectral_entropy"], y=out["frequency_band_energy"],
+                        hue=out["lof_anomaly"], palette={0: "tab:green", 1: "tab:red"}, alpha=0.7)
+        plt.title("LOF-Detected Anomalies (Red = Suspicious)")
+        plt.xlabel("Spectral Entropy"); plt.ylabel("Frequency Band Energy")
+        p1 = os.path.join(outdir, "11_lof_scatter.png")
+        plt.tight_layout(); plt.savefig(p1, dpi=200); plt.close()
+        print(f"Saved: {p1}")
+
+    # Agreement map
+    if "spectral_entropy" in out.columns and "frequency_band_energy" in out.columns:
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=out["spectral_entropy"], y=out["frequency_band_energy"],
+                        hue=out["agree"], palette={0: "tab:orange", 1: "tab:blue"}, alpha=0.7)
+        plt.title("Agreement Map: Blue = Both Models Agree")
+        plt.xlabel("Spectral Entropy"); plt.ylabel("Frequency Band Energy")
+        p2 = os.path.join(outdir, "12_agreement_map.png")
+        plt.tight_layout(); plt.savefig(p2, dpi=200); plt.close()
+        print(f"Saved: {p2}")
+
+    print(f"🤝 Agreement rate: {out['agree'].mean() * 100:.2f}%")
+    return out
+
+# -------------------- SUMMARY --------------------
+def summary_dashboard(df_val: pd.DataFrame, outdir: str):
+    total = len(df_val)
+    iso_anom = int(df_val["iso_anomaly"].sum())
+    lof_anom = int(df_val.get("lof_anomaly", pd.Series(np.zeros(total))).sum())
+    agree = int(df_val.get("agree", pd.Series(np.zeros(total))).sum())
+
+    print("\n====== Cyber Lens — Threat Summary ======")
+    print(f"Total samples: {total}")
+    print(f"Isolation Forest anomalies: {iso_anom}")
+    print(f"LOF anomalies: {lof_anom}")
+    print(f"Agreements: {agree}")
+
+    counts = pd.DataFrame({
+        "metric": ["Total", "IF anomalies", "LOF anomalies", "Agreements"],
+        "value": [total, iso_anom, lof_anom, agree]
+    })
+    plt.figure(figsize=(7, 5))
+    plt.bar(counts["metric"], counts["value"])
+    plt.title("Cyber Lens: Threat Summary"); plt.ylabel("Count")
+    p = os.path.join(outdir, "13_summary_bar.png")
+    plt.tight_layout(); plt.savefig(p, dpi=200); plt.close()
+    print(f"Saved: {p}")
+
+# -------------------- MAIN --------------------
+def main(file_path: str):
+    outdir = ensure_figdir()
+    print("🚀 Starting Cyber Lens pipeline...\n")
+
+    # Load & overview
+    df, df_enc = load_and_encode(file_path)
+    quick_overview(df)
+
+    # EDA
+    plot_correlation_heatmap(df, outdir)
+    plot_label_pie(df, outdir)
+    plot_feature_trends(df, outdir)
+
+    # Isolation Forest
+    X = df_enc.drop(columns=[c for c in ["label"] if c in df_enc.columns])
+    iso = fit_isolation_forest(X)
+    df_if = add_iforest_predictions(df, X, iso)
+    plot_iforest_scatter(df_if, outdir)
+
+    # Explainability
+    _ = explain_with_permutation_importance(X, df_if["iso_anomaly"], outdir)
+    _ = group_diff_table(df_if, X.columns.tolist(), outdir)
+
+    # Clusters
+    plot_pairplot(df_if, outdir)
+    plot_ports_scatter(df_if, outdir)
+    plot_entropy_energy(df_if, outdir)
+    plot_syn_count(df_if, outdir)
+
+    # LOF validation
+    df_val = lof_validation(df_enc, df_if, outdir)
+
+    # Summary + save
+    summary_dashboard(df_val, outdir)
+    out_csv = os.path.join(outdir, "predictions_with_scores.csv")
+    df_val.to_csv(out_csv, index=False)
+    print(f"\nSaved predictions with scores: {out_csv}")
+    print("✅ Done. Check the 'figures' folder for all charts.\n")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", type=str, default="data/ee7e1853-d39e-48dc-a7c4-1eefedb2b1ee.csv",
+                        help="Path to the CSV dataset")
+    args = parser.parse_args()
+    main(args.file)
