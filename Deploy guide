@@ -1,0 +1,16 @@
+
+# Deploy Guide
+
+## Local
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python cyber_lens_pipeline.py
+streamlit run app/streamlit_app.py
+```
+
+## GitHub
+Push: README.md, requirements.txt, streamlit_app.py, cyber_lens_pipeline.py, docs/Cyber_Lens_Report.pdf, figures/, data/
+
+## Streamlit Cloud
+- New app → connect repo → entry file: app/streamlit_app.py → deploy.
